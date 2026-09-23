@@ -1,9 +1,9 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发 - 每天北京时间 19:00 (UTC 11:00)
   schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+    - cron: '0 11 * * 1-5'     # 周一到周五，UTC 11:00 = 北京时间 19:00
   
   # 手动触发
   workflow_dispatch:
@@ -431,12 +431,22 @@ jobs:
           # 解析自选股配置：
           # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
           # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
-          # 3. 最小默认值
-          if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
-            export STOCK_LIST="$STOCK_LIST_CONFIG"
-          elif [ -z "${STOCK_LIST:-}" ]; then
-            export STOCK_LIST="600519"
+          # 3. 上面都为空 -> 暂停本次运行（不分析、不推送），不再回退默认 600519
+          STOCK_LIST_VALUE="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
+          # 去掉空白和多余逗号后再判空，避免只填了空格/逗号被误判为有内容
+          STOCK_LIST_TRIMMED="$(printf '%s' "$STOCK_LIST_VALUE" | tr -d '[:space:],')"
+
+          if [ -z "$STOCK_LIST_TRIMMED" ]; then
+            echo "=========================================="
+            echo "STOCK_LIST 为空，按配置暂停本次分析"
+            echo "（不会分析任何股票，也不会推送飞书）"
+            echo "如需恢复：Settings -> Secrets and variables -> Actions"
+            echo "          -> Repository variables -> STOCK_LIST 重新填写"
+            echo "=========================================="
+            exit 0
           fi
+
+          export STOCK_LIST="$STOCK_LIST_VALUE"
 
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
