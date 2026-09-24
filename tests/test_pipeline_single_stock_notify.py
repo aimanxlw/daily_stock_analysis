@@ -115,7 +115,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         pipeline = self._build_batch_pipeline()
         worker_calls = []
 
-        def _process(code, skip_analysis=False, single_stock_notify=False, report_type=None, analysis_query_id=None, current_time=None):
+        def _process(code, skip_analysis=False, single_stock_notify=False, report_type=None, analysis_query_id=None, current_time=None, merge_notification=False):
             worker_calls.append((code, single_stock_notify, threading.current_thread().name))
             if single_stock_notify:
                 pipeline.notifier.send(f"worker:{code}", email_stock_codes=[code])
@@ -139,6 +139,37 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         self.assertCountEqual(pipeline.notifier.sent_reports, ["single:000001", "single:600519"])
         self.assertCountEqual(pipeline.notifier.email_stock_codes, [["000001"], ["600519"]])
         pipeline._save_local_report.assert_called_once()
+        pipeline._send_notifications.assert_called_once()
+        _, kwargs = pipeline._send_notifications.call_args
+        self.assertTrue(kwargs["skip_push"])
+
+    def test_run_merge_notification_silences_per_stock_push_even_in_single_stock_mode(self):
+        """合并模式（云文档模式）下，即使单股推送开着，也不能逐只发文字。
+
+        回归点：修复前 pipeline 的 ``_send_single_stock_notification`` 调用
+        只看 ``single_stock_notify``，不看 ``merge_notification``，
+        导致云文档模式下群里仍会漏出逐只股票的文字消息。
+        """
+        pipeline = self._build_batch_pipeline()
+        pipeline.config.single_stock_notify = True
+
+        def _process(code, skip_analysis=False, single_stock_notify=False, report_type=None, analysis_query_id=None, current_time=None, merge_notification=False):
+            return _make_result(code)
+
+        pipeline.process_single_stock = MagicMock(side_effect=_process)
+
+        results = pipeline.run(
+            stock_codes=["000001", "600519"],
+            dry_run=False,
+            send_notification=True,
+            merge_notification=True,
+        )
+
+        self.assertEqual(len(results), 2)
+        # 关键断言：合并模式下不得有任何逐只文字推送
+        self.assertEqual(pipeline.notifier.sent_reports, [])
+        self.assertEqual(pipeline.notifier.email_stock_codes, [])
+        # 汇总推送也应被跳过（skip_push=True），由 main 层统一发链接
         pipeline._send_notifications.assert_called_once()
         _, kwargs = pipeline._send_notifications.call_args
         self.assertTrue(kwargs["skip_push"])

@@ -38,29 +38,55 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
     steps:
+      - name: 检查股票列表
+        id: check
+        env:
+          STOCK_LIST_CONFIG: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+        run: |
+          VALUE="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
+          TRIMMED="$(printf '%s' "$VALUE" | tr -d '[:space:],')"
+          MODE="${{ github.event.inputs.mode || vars.ANALYSIS_MODE || 'full' }}"
+          echo "运行模式: $MODE"
+          # 无股票时跳过全部步骤；但 market-only（只跑大盘）不需要股票，照常执行
+          if [ -z "$TRIMMED" ] && [ "$MODE" != "market-only" ]; then
+            echo "=========================================="
+            echo "STOCK_LIST 为空，暂停本次分析"
+            echo "（不安装依赖、不调 AI、不推送飞书）"
+            echo "=========================================="
+            echo "has_stocks=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_stocks=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 随机延迟（避免固定时间访问）
+        if: steps.check.outputs.has_stocks == 'true'
         run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
       
       - name: 检出代码
+        if: steps.check.outputs.has_stocks == 'true'
         uses: actions/checkout@v5
       
       - name: 设置 Python 环境
+        if: steps.check.outputs.has_stocks == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
       
       - name: 安装依赖
+        if: steps.check.outputs.has_stocks == 'true'
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
           python -c "import futu; print('✅ futu SDK import OK')"
       
       - name: 创建必要目录
+        if: steps.check.outputs.has_stocks == 'true'
         run: |
           mkdir -p data logs reports
       
       - name: 执行股票分析
+        if: steps.check.outputs.has_stocks == 'true'
         env:
           # ==========================================
           # AI 配置
@@ -319,10 +345,13 @@ jobs:
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
           
-          # 方式二：飞书 Webhook
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
-          FEISHU_WEBHOOK_KEYWORD: ${{ vars.FEISHU_WEBHOOK_KEYWORD || secrets.FEISHU_WEBHOOK_KEYWORD }}
+          # 方式二：飞书（已改为「应用机器人 App Bot」主动推送）
+          #   说明：不再使用群自定义机器人 Webhook。应用凭据 + chat_id 见下方
+          #   FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID 三项。
+          #   若将来需要回退到 Webhook，取消下面三行注释并在仓库配置对应 Secret。
+          # FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          # FEISHU_WEBHOOK_KEYWORD: ${{ vars.FEISHU_WEBHOOK_KEYWORD || secrets.FEISHU_WEBHOOK_KEYWORD }}
           # 钉钉 Webhook
           DINGTALK_WEBHOOK_URL: ${{ secrets.DINGTALK_WEBHOOK_URL }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
@@ -364,7 +393,9 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_MAIN_CHANNEL_ID: ${{ secrets.DISCORD_MAIN_CHANNEL_ID }}
           
-          # 方式九：飞书云文档
+          # 方式九：飞书（应用机器人 App Bot）
+          #   应用凭据 + 目标群 chat_id，用于「主动推送」消息与创建云文档。
+          #   配置齐全后：报告写成云文档，群里只发一条带链接的短消息。
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
@@ -432,11 +463,13 @@ jobs:
           # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
           # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
           # 3. 上面都为空 -> 暂停本次运行（不分析、不推送），不再回退默认 600519
+          MODE="${{ github.event.inputs.mode || vars.ANALYSIS_MODE || 'full' }}"
           STOCK_LIST_VALUE="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
           # 去掉空白和多余逗号后再判空，避免只填了空格/逗号被误判为有内容
           STOCK_LIST_TRIMMED="$(printf '%s' "$STOCK_LIST_VALUE" | tr -d '[:space:],')"
 
-          if [ -z "$STOCK_LIST_TRIMMED" ]; then
+          # 无股票时暂停；但 market-only（只跑大盘）不需要股票，继续往下跑
+          if [ -z "$STOCK_LIST_TRIMMED" ] && [ "$MODE" != "market-only" ]; then
             echo "=========================================="
             echo "STOCK_LIST 为空，按配置暂停本次分析"
             echo "（不会分析任何股票，也不会推送飞书）"
@@ -458,9 +491,7 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
-          
+          # 运行模式已在步骤开头解析（守卫也要用到）
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
           echo "=========================================="
@@ -521,7 +552,7 @@ jobs:
           echo "  Gotify: $([ -n "$GOTIFY_URL" ] && [ -n "$GOTIFY_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  企业微信: $([ -n "$WECHAT_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  钉钉: $( [ -n "$DINGTALK_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置' )"
-          echo "  飞书: $( ([ -n "$FEISHU_WEBHOOK_URL" ] || ([ -n "$FEISHU_APP_ID" ] && [ -n "$FEISHU_APP_SECRET" ] && [ -n "$FEISHU_CHAT_ID" ]) ) && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  飞书(App Bot): $( ([ -n "$FEISHU_APP_ID" ] && [ -n "$FEISHU_APP_SECRET" ] && [ -n "$FEISHU_CHAT_ID" ]) && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Telegram: $([ -n "$TELEGRAM_BOT_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Discord: $([ -n "$DISCORD_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  AstrBot: $([ -n "$ASTRBOT_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
@@ -547,7 +578,7 @@ jobs:
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
-        if: always()
+        if: always() && steps.check.outputs.has_stocks == 'true'
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
@@ -556,7 +587,7 @@ jobs:
           retention-days: 30
       
       - name: 显示运行结果
-        if: always()
+        if: always() && steps.check.outputs.has_stocks == 'true'
         run: |
           echo ""
           echo "=========================================="

@@ -3301,6 +3301,7 @@ class StockAnalysisPipeline:
         analysis_query_id: Optional[str] = None,
         current_time: Optional[datetime] = None,
         analysis_target: Optional[AnalysisTarget] = None,
+        merge_notification: bool = False,
     ) -> Optional[AnalysisResult]:
         """
         处理单只股票的完整流程
@@ -3321,6 +3322,8 @@ class StockAnalysisPipeline:
             report_type: 报告类型枚举（从配置读取，Issue #119）
             current_time: 本轮运行冻结的参考时间，用于统一断点续传目标交易日判断
             analysis_target: 结构化分析目标（指数目标用于推导 market=cn 与能力矩阵）
+            merge_notification: 合并推送模式；为 True 时静默逐只推送，
+                由 main 层统一推送云文档链接（避免文字漏出）
 
         Returns:
             AnalysisResult 或 None
@@ -3374,7 +3377,8 @@ class StockAnalysisPipeline:
                 )
                 
                 # 单股推送模式（#55）：每分析完一只股票立即推送
-                if single_stock_notify:
+                # 合并模式（云文档模式）下必须静默，否则会漏出一条文字推送。
+                if single_stock_notify and not merge_notification:
                     self._send_single_stock_notification(
                         result,
                         report_type=report_type,
@@ -3534,6 +3538,7 @@ class StockAnalysisPipeline:
                     "report_type": report_type,
                     "analysis_query_id": uuid.uuid4().hex,
                     "current_time": resume_reference_time,
+                    "merge_notification": merge_notification,
                 }
                 if target is not None:
                     submit_kwargs["analysis_target"] = target
@@ -3551,7 +3556,13 @@ class StockAnalysisPipeline:
                     result = future.result()
                     if result and result.success:
                         results.append(result)
-                        if single_stock_notify and send_notification and not dry_run:
+                        # 合并模式（云文档模式）下静默逐只推送，避免文字漏出。
+                        if (
+                            single_stock_notify
+                            and not merge_notification
+                            and send_notification
+                            and not dry_run
+                        ):
                             self._send_single_stock_notification(
                                 result,
                                 report_type=report_type,

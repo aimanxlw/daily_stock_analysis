@@ -379,6 +379,266 @@ class MainPortfolioTest(unittest.TestCase):
         self.assertIn("# 🚀 个股决策仪表盘\n\ndashboard", combined_content)
         run_auto_backtest.assert_called_once_with(config)
 
+    def test_run_full_analysis_sends_doc_link_instead_of_long_text_when_doc_configured(self):
+        """云文档凭据齐全时：只推一条文档链接，不再推长文本合并消息。"""
+        args = SimpleNamespace(
+            portfolio=None,
+            single_notify=False,
+            no_context_snapshot=True,
+            no_market_review=False,
+            workers=1,
+            dry_run=False,
+            no_notify=False,
+            schedule=False,
+        )
+        config = SimpleNamespace(
+            refresh_stock_list=MagicMock(),
+            single_stock_notify=False,
+            merge_email_notification=False,
+            market_review_enabled=True,
+            market_review_region="cn",
+            daily_market_context_enabled=False,
+            analysis_delay=0,
+            backtest_enabled=False,
+            report_type="simple",
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret_test",
+            feishu_folder_token="fld_test",
+        )
+        pipeline = MagicMock()
+        pipeline.run.return_value = [
+            SimpleNamespace(
+                code="600519",
+                success=True,
+                sentiment_score=90,
+                name="贵州茅台",
+                operation_advice="持有",
+                trend_prediction="震荡上行",
+                get_emoji=MagicMock(return_value="📈"),
+            )
+        ]
+        pipeline._last_local_report_path = "report_600519.md"
+        pipeline._last_local_report_error = None
+        pipeline.notifier = MagicMock(
+            is_available=MagicMock(return_value=True),
+            generate_aggregate_report=MagicMock(return_value="dashboard"),
+            send=MagicMock(return_value=True),
+        )
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), patch.object(
+            main,
+            "_compute_trading_day_filter",
+            return_value=(["600519"], "cn", False),
+        ), patch(
+            "src.core.pipeline.StockAnalysisPipeline",
+            return_value=pipeline,
+        ), patch(
+            "src.core.market_review.run_market_review",
+        ), patch.object(
+            main,
+            "_run_market_review_with_shared_lock",
+            return_value=SimpleNamespace(report="market review"),
+        ), patch(
+            "src.feishu_doc.FeishuDocManager",
+        ) as feishu_manager, patch.object(
+            main,
+            "_run_auto_backtest",
+        ):
+            feishu_instance = feishu_manager.return_value
+            feishu_instance.is_configured.return_value = True
+            feishu_instance.create_daily_doc.return_value = "https://feishu.example/doc"
+            main.run_full_analysis(config, args, ["600519"])
+
+        # 有云文档 -> 强制合并（流水线/大盘各自静默）
+        self.assertTrue(pipeline.run.call_args.kwargs["merge_notification"])
+        # 文档已创建，内容含大盘 + 个股
+        feishu_instance.create_daily_doc.assert_called_once()
+        _, doc_content = feishu_instance.create_daily_doc.call_args.args
+        self.assertIn("# 🚀 个股决策仪表盘\n\ndashboard", doc_content)
+        self.assertIn("# 📈 大盘复盘\n\nmarket review", doc_content)
+        # 只推一条链接，且不是长文本
+        pipeline.notifier.send.assert_called_once()
+        sent = pipeline.notifier.send.call_args.args[0]
+        self.assertIn("复盘文档创建成功", sent)
+        self.assertIn("https://feishu.example/doc", sent)
+        self.assertNotIn("# 🚀 个股决策仪表盘", sent)
+
+    def _build_doc_mode_config(self, **overrides):
+        """构造「云文档凭据齐全」的 config，供下方三种模式测试复用。"""
+        base = dict(
+            refresh_stock_list=MagicMock(),
+            single_stock_notify=False,
+            merge_email_notification=False,
+            market_review_enabled=True,
+            market_review_region="cn",
+            daily_market_context_enabled=False,
+            analysis_delay=0,
+            backtest_enabled=False,
+            report_type="simple",
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret_test",
+            feishu_folder_token="fld_test",
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _build_doc_mode_pipeline(self, results):
+        pipeline = MagicMock()
+        pipeline.run.return_value = results
+        pipeline._last_local_report_path = "report_600519.md"
+        pipeline._last_local_report_error = None
+        pipeline.notifier = MagicMock(
+            is_available=MagicMock(return_value=True),
+            generate_aggregate_report=MagicMock(return_value="dashboard"),
+            send=MagicMock(return_value=True),
+        )
+        return pipeline
+
+    def test_doc_mode_merges_notification_even_with_no_market_review(self):
+        """云文档模式 + --no-market-review（仅个股）：个股文字推送必须被静默。
+
+        回归点：修复前 merge_notification 会被 no_market_review 置为 False，
+        导致个股自己推一条文字消息到群里。
+        """
+        args = SimpleNamespace(
+            portfolio=None,
+            single_notify=False,
+            no_context_snapshot=True,
+            no_market_review=True,
+            workers=1,
+            dry_run=False,
+            no_notify=False,
+            schedule=False,
+        )
+        config = self._build_doc_mode_config()
+        pipeline = self._build_doc_mode_pipeline(
+            [
+                SimpleNamespace(
+                    code="600519",
+                    success=True,
+                    sentiment_score=90,
+                    name="贵州茅台",
+                    operation_advice="持有",
+                    trend_prediction="震荡上行",
+                    get_emoji=MagicMock(return_value="📈"),
+                )
+            ]
+        )
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), patch.object(
+            main, "_compute_trading_day_filter", return_value=(["600519"], "cn", False)
+        ), patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), patch(
+            "src.core.market_review.run_market_review"
+        ), patch.object(
+            main, "_run_auto_backtest"
+        ), patch("src.feishu_doc.FeishuDocManager") as feishu_manager:
+            feishu_instance = feishu_manager.return_value
+            feishu_instance.is_configured.return_value = True
+            feishu_instance.create_daily_doc.return_value = "https://feishu.example/doc"
+            main.run_full_analysis(config, args, ["600519"])
+
+        # 关键断言：即使 --no-market-review，也要合并（个股文字被静默）
+        self.assertTrue(pipeline.run.call_args.kwargs["merge_notification"])
+        # 只推一条链接
+        pipeline.notifier.send.assert_called_once()
+        sent = pipeline.notifier.send.call_args.args[0]
+        self.assertIn("https://feishu.example/doc", sent)
+        self.assertNotIn("# 🚀 个股决策仪表盘", sent)
+        # 标题应体现"个股"，而不是硬编码的"大盘复盘"
+        _, doc_title = feishu_instance.create_daily_doc.call_args.args
+        self.assertIn("个股", doc_title)
+
+    def test_doc_mode_merges_notification_even_with_single_stock_notify(self):
+        """云文档模式 + single_stock_notify=True：同样必须静默个股文字推送。"""
+        args = SimpleNamespace(
+            portfolio=None,
+            single_notify=False,
+            no_context_snapshot=True,
+            no_market_review=False,
+            workers=1,
+            dry_run=False,
+            no_notify=False,
+            schedule=False,
+        )
+        config = self._build_doc_mode_config(single_stock_notify=True)
+        pipeline = self._build_doc_mode_pipeline(
+            [
+                SimpleNamespace(
+                    code="600519",
+                    success=True,
+                    sentiment_score=90,
+                    name="贵州茅台",
+                    operation_advice="持有",
+                    trend_prediction="震荡上行",
+                    get_emoji=MagicMock(return_value="📈"),
+                )
+            ]
+        )
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), patch.object(
+            main, "_compute_trading_day_filter", return_value=(["600519"], "cn", False)
+        ), patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), patch(
+            "src.core.market_review.run_market_review"
+        ), patch.object(
+            main, "_run_market_review_with_shared_lock",
+            return_value=SimpleNamespace(report="market review"),
+        ), patch.object(
+            main, "_run_auto_backtest"
+        ), patch("src.feishu_doc.FeishuDocManager") as feishu_manager:
+            feishu_instance = feishu_manager.return_value
+            feishu_instance.is_configured.return_value = True
+            feishu_instance.create_daily_doc.return_value = "https://feishu.example/doc"
+            main.run_full_analysis(config, args, ["600519"])
+
+        self.assertTrue(pipeline.run.call_args.kwargs["merge_notification"])
+        pipeline.notifier.send.assert_called_once()
+        sent = pipeline.notifier.send.call_args.args[0]
+        self.assertIn("https://feishu.example/doc", sent)
+
+    def test_doc_mode_merges_notification_even_when_market_review_disabled(self):
+        """云文档模式 + market_review_enabled=False：仅个股场景同样只推链接。"""
+        args = SimpleNamespace(
+            portfolio=None,
+            single_notify=False,
+            no_context_snapshot=True,
+            no_market_review=False,
+            workers=1,
+            dry_run=False,
+            no_notify=False,
+            schedule=False,
+        )
+        config = self._build_doc_mode_config(market_review_enabled=False)
+        pipeline = self._build_doc_mode_pipeline(
+            [
+                SimpleNamespace(
+                    code="600519",
+                    success=True,
+                    sentiment_score=90,
+                    name="贵州茅台",
+                    operation_advice="持有",
+                    trend_prediction="震荡上行",
+                    get_emoji=MagicMock(return_value="📈"),
+                )
+            ]
+        )
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), patch.object(
+            main, "_compute_trading_day_filter", return_value=(["600519"], "cn", False)
+        ), patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), patch(
+            "src.core.market_review.run_market_review"
+        ), patch.object(
+            main, "_run_auto_backtest"
+        ), patch("src.feishu_doc.FeishuDocManager") as feishu_manager:
+            feishu_instance = feishu_manager.return_value
+            feishu_instance.is_configured.return_value = True
+            feishu_instance.create_daily_doc.return_value = "https://feishu.example/doc"
+            main.run_full_analysis(config, args, ["600519"])
+
+        self.assertTrue(pipeline.run.call_args.kwargs["merge_notification"])
+        pipeline.notifier.send.assert_called_once()
+        sent = pipeline.notifier.send.call_args.args[0]
+        self.assertIn("https://feishu.example/doc", sent)
+
     def test_run_full_analysis_returns_false_when_market_review_only_run_generates_no_report(self):
         args = SimpleNamespace(
             portfolio=None,

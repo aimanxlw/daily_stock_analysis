@@ -2120,6 +2120,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
             return pipeline
 
         runtime_context = ("本轮运行时复盘摘要", "## 本轮运行时完整复盘")
+        # 隔离：本用例断言的是「文字推送」路径，必须屏蔽真实的飞书云文档创建，
+        # 否则本地 .env 若配了 FEISHU_APP_ID 等凭据，会真的联网建文档并改走链接推送。
         with patch.object(main, "_refresh_stock_index_cache_for_analysis") as refresh, \
              patch("main._compute_trading_day_filter", return_value=([], "cn", False)), \
              patch("main._resolve_daily_market_context_target_date", return_value=target_date), \
@@ -2129,7 +2131,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
                  side_effect=[("", ""), ("", ""), runtime_context],
              ) as prime_context, \
              patch("main._run_market_review_with_shared_lock") as run_with_lock, \
-             patch("src.core.market_review.run_market_review") as run_market_review:
+             patch("src.core.market_review.run_market_review") as run_market_review, \
+             patch("src.feishu_doc.FeishuDocManager") as feishu_manager:
+            feishu_manager.return_value.is_configured.return_value = False
             main.run_full_analysis(config, args, [])
 
         self.assertTrue(pipeline_kwargs["daily_market_context_allow_generate"])
@@ -2396,7 +2400,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
                 ),
              ) as prime_context, \
              patch("main._run_market_review_with_shared_lock") as run_with_lock, \
-             patch("src.core.market_review.run_market_review") as run_market_review:
+             patch("src.core.market_review.run_market_review") as run_market_review, \
+             patch("src.feishu_doc.FeishuDocManager") as feishu_manager:
+            feishu_manager.return_value.is_configured.return_value = False
             main.run_full_analysis(config, args, [])
 
         self.assertTrue(pipeline_kwargs["daily_market_context_allow_generate"])

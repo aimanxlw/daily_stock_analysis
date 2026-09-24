@@ -882,13 +882,28 @@ def run_full_analysis(
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
 
-        # Issue #190: 个股与大盘复盘合并推送
-        merge_notification = (
-            getattr(config, 'merge_email_notification', False)
-            and config.market_review_enabled
-            and not getattr(args, 'no_market_review', False)
-            and not config.single_stock_notify
+        # 方案A：若飞书云文档凭据齐全，视同"合并推送"开启
+        #（让流水线/大盘复盘各自静默，改由 main 统一推送文档链接，避免长文本刷屏）
+        _feishu_doc_ready = bool(
+            getattr(config, 'feishu_app_id', None)
+            and getattr(config, 'feishu_app_secret', None)
+            and getattr(config, 'feishu_folder_token', None)
         )
+
+        # Issue #190: 个股与大盘复盘合并推送
+        # 云文档模式下无条件合并：无论「只个股」「只大盘」「个股+大盘」，
+        # 一律静默各子流程的文字推送，由 main 统一推一条文档链接。
+        # 注意：这里**不**受 no_market_review / single_stock_notify 影响，
+        #       否则会出现「个股自己发一条文字」这种漏网推送。
+        if _feishu_doc_ready:
+            merge_notification = True
+        else:
+            merge_notification = (
+                getattr(config, 'merge_email_notification', False)
+                and config.market_review_enabled
+                and not getattr(args, 'no_market_review', False)
+                and not config.single_stock_notify
+            )
 
         # 创建调度器
         save_context_snapshot = None
@@ -1123,24 +1138,71 @@ def run_full_analysis(
             )
             return _return_with_auto_backtest(False)
 
-        # Issue #190: 合并推送（个股+大盘复盘）
-        if merge_notification and (results or market_report) and not args.no_notify:
-            parts = []
-            if market_report:
-                parts.append(f"# 📈 大盘复盘\n\n{market_report}")
-            if results:
-                dashboard_content = pipeline.notifier.generate_aggregate_report(
-                    results,
-                    getattr(config, 'report_type', 'simple'),
-                )
-                parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
-            if parts:
-                combined_content = "\n\n---\n\n".join(parts)
-                if pipeline.notifier.is_available():
-                    if pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report"):
-                        logger.info("已合并推送（个股+大盘复盘）")
+        # === 方案A：先生成飞书云文档（成功则只推一条链接，替代长文本） ===
+        # 注意：文档导出不受 --no-notify 影响（与原有语义一致），只有下方"链接推送"受其控制。
+        feishu_doc_url = None
+        feishu_doc_title = None
+        if results or market_report:
+            try:
+                from src.feishu_doc import FeishuDocManager
+
+                feishu_doc = FeishuDocManager()
+                if feishu_doc.is_configured():
+                    logger.info("正在创建飞书云文档...")
+                    tz_cn = timezone(timedelta(hours=8))
+                    now = datetime.now(tz_cn)
+                    # 标题按实际内容命名，避免"只跑个股"时仍显示"大盘复盘"
+                    if market_report and results:
+                        _doc_kind = "大盘复盘 + 个股"
+                    elif market_report:
+                        _doc_kind = "大盘复盘"
                     else:
-                        logger.warning("合并推送失败")
+                        _doc_kind = "个股决策"
+                    feishu_doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} {_doc_kind}"
+
+                    full_content = ""
+                    if market_report:
+                        full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
+                    if results:
+                        dashboard_content = pipeline.notifier.generate_aggregate_report(
+                            results,
+                            getattr(config, 'report_type', 'simple'),
+                        )
+                        full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
+
+                    feishu_doc_url = feishu_doc.create_daily_doc(feishu_doc_title, full_content)
+                    if feishu_doc_url:
+                        logger.info(f"飞书云文档创建成功: {feishu_doc_url}")
+            except Exception as e:
+                logger.error(f"飞书文档生成失败: {e}")
+
+        # 推送：有云文档 -> 只推一条带链接的短消息；否则回退到合并长文本（Issue #190）
+        if not args.no_notify:
+            if feishu_doc_url:
+                if pipeline.notifier.send(
+                    f"[{feishu_doc_title}] 复盘文档创建成功: {feishu_doc_url}",
+                    route_type="report",
+                ):
+                    logger.info("已推送飞书云文档链接（长文本已跳过）")
+                else:
+                    logger.warning("飞书云文档链接推送失败")
+            elif merge_notification and (results or market_report):
+                parts = []
+                if market_report:
+                    parts.append(f"# 📈 大盘复盘\n\n{market_report}")
+                if results:
+                    dashboard_content = pipeline.notifier.generate_aggregate_report(
+                        results,
+                        getattr(config, 'report_type', 'simple'),
+                    )
+                    parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
+                if parts:
+                    combined_content = "\n\n---\n\n".join(parts)
+                    if pipeline.notifier.is_available():
+                        if pipeline.notifier.send(combined_content, email_send_to_all=True, route_type="report"):
+                            logger.info("已合并推送（个股+大盘复盘）")
+                        else:
+                            logger.warning("合并推送失败")
 
         # 输出摘要
         if results:
@@ -1153,48 +1215,6 @@ def run_full_analysis(
                 )
 
         logger.info("\n任务执行完成")
-
-        # === 新增：生成飞书云文档 ===
-        try:
-            from src.feishu_doc import FeishuDocManager
-
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
-                logger.info("正在创建飞书云文档...")
-
-                # 1. 准备标题 "01-01 13:01大盘复盘"
-                tz_cn = timezone(timedelta(hours=8))
-                now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
-
-                # 2. 准备内容 (拼接个股分析和大盘复盘)
-                full_content = ""
-
-                # 添加大盘复盘内容（如果有）
-                if market_report:
-                    full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-
-                # 添加个股决策仪表盘（使用 NotificationService 生成，按 report_type 分支）
-                if results:
-                    dashboard_content = pipeline.notifier.generate_aggregate_report(
-                        results,
-                        getattr(config, 'report_type', 'simple'),
-                    )
-                    full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
-
-                # 3. 创建文档
-                doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
-                if doc_url:
-                    logger.info(f"飞书云文档创建成功: {doc_url}")
-                    # 可选：将文档链接也推送到群里
-                    if not args.no_notify:
-                        pipeline.notifier.send(
-                            f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
-                            route_type="report",
-                        )
-
-        except Exception as e:
-            logger.error(f"飞书文档生成失败: {e}")
 
         return _return_with_auto_backtest(
             deferred_failure_result
