@@ -563,6 +563,75 @@ def _run_market_review_with_shared_lock(
         release_market_review_lock(lock_token)
 
 
+def _deliver_market_review_report(
+    *,
+    notifier: Any,
+    report_text: str,
+    no_notify: bool,
+) -> bool:
+    """Deliver a market-only review: cloud doc first, push link, fall back to text.
+
+    Behaviour mirrors ``run_full_analysis``:
+      * the cloud doc is exported whenever credentials are ready, even under
+        ``--no-notify`` (that flag only silences *push*, not export);
+      * otherwise the link message is pushed, falling back to a plain long-text
+        push so the chat is never silently skipped — a run that reports success
+        while nothing reaches the group is exactly the bug this guards against.
+
+    Returns:
+        ``True`` when something was actually delivered (or exported).
+    """
+    text = (report_text or "").strip()
+    if not text:
+        logger.warning("大盘复盘正文为空，跳过投递")
+        return False
+
+    feishu_doc_url = None
+    feishu_doc_title = None
+    try:
+        from src.feishu_doc import FeishuDocManager
+
+        feishu_doc = FeishuDocManager()
+        if feishu_doc.is_configured():
+            tz_cn = timezone(timedelta(hours=8))
+            now = datetime.now(tz_cn)
+            feishu_doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
+            logger.info("正在创建飞书云文档...")
+            feishu_doc_url = feishu_doc.create_daily_doc(
+                feishu_doc_title, f"# 📈 大盘复盘\n\n{text}"
+            )
+            if feishu_doc_url:
+                logger.info(f"飞书云文档创建成功: {feishu_doc_url}")
+    except Exception as e:
+        logger.error(f"飞书文档生成失败: {e}")
+
+    if no_notify:
+        if feishu_doc_url:
+            logger.info("--no-notify 生效：已导出云文档但不推送链接")
+            return True
+        return False
+
+    if not notifier.is_available():
+        logger.warning("通知渠道不可用，复盘内容仅保留在本地报告")
+        return False
+
+    if feishu_doc_url:
+        if notifier.send(
+            f"[{feishu_doc_title}] 复盘文档创建成功: {feishu_doc_url}",
+            route_type="report",
+        ):
+            logger.info("已推送飞书云文档链接（长文本已跳过）")
+            return True
+        logger.warning("飞书云文档链接推送失败，回退为长文本推送")
+
+    if notifier.send(text, email_send_to_all=True, route_type="report"):
+        logger.info("已推送大盘复盘长文本")
+        return True
+
+    logger.warning("大盘复盘推送失败")
+    return False
+
+
 def _is_multi_market_region(region: str) -> bool:
     normalized = str(region or "").strip().lower()
     if not normalized:
@@ -1760,6 +1829,15 @@ def main() -> int:
             logger.info("模式: 仅大盘复盘")
             notifier, analyzer, search_service = build_market_review_runtime(config)
 
+            # 飞书云文档凭据齐全时改走「建文档 + 群内只发一条链接」：
+            # 让 run_market_review 保持静默（merge_notification），投递统一交给
+            # _deliver_market_review_report，避免文字与链接同时刷屏。
+            _feishu_doc_ready = bool(
+                getattr(config, 'feishu_app_id', None)
+                and getattr(config, 'feishu_app_secret', None)
+                and getattr(config, 'feishu_folder_token', None)
+            )
+
             market_review_result = _run_market_review_with_shared_lock(
                 config,
                 run_market_review,
@@ -1767,10 +1845,28 @@ def main() -> int:
                 analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify,
+                merge_notification=_feishu_doc_ready,
+                return_structured=True,
                 override_region=effective_region,
                 trigger_source="cli",
             )
-            return 0 if market_review_result else 1
+
+            if market_review_result is None:
+                # 复盘锁被其它进程占用，本轮未执行
+                return 1
+
+            # return_structured=True 时返回 MarketReviewRunResult（dataclass 恒为真），
+            # 因此成败依据 report 正文是否为空来判断，与原字符串语义保持一致。
+            _review_report_text = getattr(market_review_result, "report", "") or ""
+
+            if _feishu_doc_ready:
+                _deliver_market_review_report(
+                    notifier=notifier,
+                    report_text=_review_report_text,
+                    no_notify=bool(args.no_notify),
+                )
+
+            return 0 if _review_report_text.strip() else 1
 
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:

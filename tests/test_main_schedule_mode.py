@@ -887,7 +887,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
              patch("main._run_market_review_with_shared_lock") as run_review, \
              patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn"}), \
              patch("src.core.trading_calendar.compute_effective_region", return_value="cn"):
-            run_review.return_value = object()
+            # return_structured=True 后返回结构化结果，退出码依据 report 正文判断
+            run_review.return_value = SimpleNamespace(report="# 大盘复盘\n\n正文")
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
@@ -2624,7 +2625,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertIs(call_args.kwargs["analyzer"], runtime_analyzer)
         self.assertIs(call_args.kwargs["search_service"], runtime_search_service)
         self.assertTrue(call_args.kwargs["send_notification"])
-        self.assertNotIn("merge_notification", call_args.kwargs)
+        # 未配置飞书云文档凭据时不静默，保持 run_market_review 自行推送
+        self.assertFalse(call_args.kwargs["merge_notification"])
+        self.assertTrue(call_args.kwargs["return_structured"])
         self.assertEqual(call_args.kwargs["override_region"], "cn,us")
         self.assertEqual(call_args.kwargs["trigger_source"], "cli")
 
@@ -2683,6 +2686,185 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertIs(call_args.args[0], config)
         self.assertEqual(call_args.kwargs["override_region"], "jp,kr")
         self.assertEqual(call_args.kwargs["trigger_source"], "cli")
+
+    def test_market_review_mode_silences_and_delivers_doc_link_when_doc_ready(
+        self,
+    ) -> None:
+        """云文档凭据齐全时，market-only 必须静默文字推送并改推文档链接。"""
+        args = self._make_args(market_review=True)
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_region="cn",
+            market_review_enabled=False,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret_test",
+            feishu_folder_token="fld_test",
+        )
+        runtime_notifier = MagicMock()
+        run_result = SimpleNamespace(report="# 大盘复盘\n\n正文内容")
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch(
+                 "main._run_market_review_with_shared_lock",
+                 return_value=run_result,
+             ) as run_with_lock, \
+             patch(
+                 "src.core.market_review_runtime.build_market_review_runtime",
+                 return_value=(runtime_notifier, MagicMock(), MagicMock()),
+             ), \
+             patch("src.core.market_review.run_market_review"), \
+             patch("main._deliver_market_review_report", return_value=True) as deliver, \
+             patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn"}), \
+             patch("src.core.trading_calendar.compute_effective_region", return_value="cn"):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        call_args = run_with_lock.call_args
+        self.assertTrue(call_args.kwargs["merge_notification"])
+        self.assertTrue(call_args.kwargs["return_structured"])
+        deliver.assert_called_once()
+        self.assertIs(deliver.call_args.kwargs["notifier"], runtime_notifier)
+        self.assertEqual(deliver.call_args.kwargs["report_text"], "# 大盘复盘\n\n正文内容")
+        self.assertFalse(deliver.call_args.kwargs["no_notify"])
+
+    def test_market_review_mode_does_not_deliver_when_doc_not_configured(self) -> None:
+        """无云文档凭据时保持原行为：不静默，也不走文档投递。"""
+        args = self._make_args(market_review=True)
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_region="cn",
+            market_review_enabled=False,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+        )
+        run_result = SimpleNamespace(report="# 大盘复盘\n\n正文内容")
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch(
+                 "main._run_market_review_with_shared_lock",
+                 return_value=run_result,
+             ) as run_with_lock, \
+             patch(
+                 "src.core.market_review_runtime.build_market_review_runtime",
+                 return_value=(MagicMock(), MagicMock(), MagicMock()),
+             ), \
+             patch("src.core.market_review.run_market_review"), \
+             patch("main._deliver_market_review_report") as deliver, \
+             patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn"}), \
+             patch("src.core.trading_calendar.compute_effective_region", return_value="cn"):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(run_with_lock.call_args.kwargs["merge_notification"])
+        deliver.assert_not_called()
+
+    def test_market_review_mode_returns_nonzero_when_doc_mode_report_is_blank(self) -> None:
+        """结构化返回恒为真，成败必须依据 report 正文判断。"""
+        args = self._make_args(market_review=True)
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_region="cn",
+            market_review_enabled=False,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret_test",
+            feishu_folder_token="fld_test",
+        )
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch(
+                 "main._run_market_review_with_shared_lock",
+                 return_value=SimpleNamespace(report="   "),
+             ), \
+             patch(
+                 "src.core.market_review_runtime.build_market_review_runtime",
+                 return_value=(MagicMock(), MagicMock(), MagicMock()),
+             ), \
+             patch("src.core.market_review.run_market_review"), \
+             patch("main._deliver_market_review_report", return_value=False), \
+             patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn"}), \
+             patch("src.core.trading_calendar.compute_effective_region", return_value="cn"):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 1)
+
+    def test_deliver_market_review_report_pushes_link_and_skips_long_text(self) -> None:
+        """云文档创建成功时只推一条链接，不再推长文本。"""
+        notifier = MagicMock()
+        notifier.is_available.return_value = True
+        notifier.send.return_value = True
+
+        with patch("src.feishu_doc.FeishuDocManager") as doc_cls:
+            doc_cls.return_value.is_configured.return_value = True
+            doc_cls.return_value.create_daily_doc.return_value = "https://feishu.cn/docx/abc"
+            delivered = main._deliver_market_review_report(
+                notifier=notifier,
+                report_text="# 大盘复盘\n\n正文",
+                no_notify=False,
+            )
+
+        self.assertTrue(delivered)
+        notifier.send.assert_called_once()
+        self.assertIn("https://feishu.cn/docx/abc", notifier.send.call_args.args[0])
+        self.assertNotIn("正文", notifier.send.call_args.args[0])
+
+    def test_deliver_market_review_report_falls_back_to_long_text(self) -> None:
+        """云文档不可用时回退长文本，避免任务成功但群里静默。"""
+        notifier = MagicMock()
+        notifier.is_available.return_value = True
+        notifier.send.return_value = True
+
+        with patch("src.feishu_doc.FeishuDocManager") as doc_cls:
+            doc_cls.return_value.is_configured.return_value = False
+            delivered = main._deliver_market_review_report(
+                notifier=notifier,
+                report_text="# 大盘复盘\n\n正文",
+                no_notify=False,
+            )
+
+        self.assertTrue(delivered)
+        notifier.send.assert_called_once()
+        self.assertEqual(notifier.send.call_args.args[0], "# 大盘复盘\n\n正文")
+
+    def test_deliver_market_review_report_no_notify_exports_without_push(self) -> None:
+        """--no-notify 只静默推送，不影响云文档导出（与 full 模式语义一致）。"""
+        notifier = MagicMock()
+        notifier.is_available.return_value = True
+        notifier.send.return_value = True
+
+        with patch("src.feishu_doc.FeishuDocManager") as doc_cls:
+            doc_cls.return_value.is_configured.return_value = True
+            doc_cls.return_value.create_daily_doc.return_value = "https://feishu.cn/docx/abc"
+            delivered = main._deliver_market_review_report(
+                notifier=notifier,
+                report_text="# 大盘复盘\n\n正文",
+                no_notify=True,
+            )
+
+        self.assertTrue(delivered)
+        doc_cls.return_value.create_daily_doc.assert_called_once()
+        notifier.send.assert_not_called()
+
+    def test_deliver_market_review_report_skips_blank_text(self) -> None:
+        """正文为空时不投递，避免推送空消息。"""
+        notifier = MagicMock()
+
+        with patch("src.feishu_doc.FeishuDocManager") as doc_cls:
+            delivered = main._deliver_market_review_report(
+                notifier=notifier,
+                report_text="   ",
+                no_notify=False,
+            )
+
+        self.assertFalse(delivered)
+        doc_cls.assert_not_called()
+        notifier.send.assert_not_called()
 
     def test_bootstrap_logging_persists_when_config_load_fails(self) -> None:
         """Config load failure must be logged to stderr and return exit code 1.
