@@ -425,20 +425,57 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        stock_df, stock_source, stock_errors = self._call_df_candidates([
-            ("stock_individual_fund_flow", {"stock": stock_code}),
-            ("stock_individual_fund_flow", {"symbol": stock_code}),
-            ("stock_individual_fund_flow", {}),
-            ("stock_main_fund_flow", {"symbol": stock_code}),
-            ("stock_main_fund_flow", {}),
-        ])
+        # 东财接口偶发断连，保留两种参数形式做重试；无效候选（symbol= / 空参数）
+        # 只会白白消耗重试机会，已移除。首轮全败则停 3 秒再试一轮，避开瞬时限流
+        code = _normalize_code(stock_code)
+        market = "sh" if code[:1] in ("5", "6", "9") else ("bj" if code[:1] in ("4", "8") else "sz")
+        stock_df, stock_source, stock_errors = None, None, []
+        for attempt in range(2):
+            stock_df, stock_source, stock_errors = self._call_df_candidates([
+                ("stock_individual_fund_flow", {"stock": code, "market": market}),
+                ("stock_individual_fund_flow", {"stock": code}),
+            ])
+            if stock_df is not None:
+                break
+            if attempt == 0:
+                import time as _time
+                _time.sleep(3)
         result["errors"].extend(stock_errors)
         if stock_df is not None:
-            row = _extract_latest_row(stock_df, stock_code)
+            date_col = next((c for c in stock_df.columns if "日期" in str(c)), None)
+            flow_col = next(
+                (c for c in stock_df.columns
+                 if "主力净流入" in str(c) and "占比" not in str(c)),
+                None,
+            ) or next(
+                (c for c in stock_df.columns
+                 if any(k in str(c) for k in ("主力净流入", "净流入", "净额"))),
+                None,
+            )
+            if date_col is not None:
+                try:
+                    stock_df = stock_df.sort_values(date_col)
+                except Exception:
+                    pass
+            code_cols = [c for c in stock_df.columns
+                         if any(k in str(c) for k in ("代码", "ts_code", "symbol"))]
+            if code_cols:
+                row = _extract_latest_row(stock_df, stock_code)
+            else:
+                # 单只股票的日频历史表（无代码列）：日期排序后取最后一行才是最新值
+                row = stock_df.iloc[-1] if len(stock_df) else None
             if row is not None:
-                net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
-                inflow_5d = _safe_float(_pick_by_keywords(row, ["5日", "五日"]))
-                inflow_10d = _safe_float(_pick_by_keywords(row, ["10日", "十日"]))
+                if flow_col is not None and flow_col in row.index:
+                    net_inflow = _safe_float(row.get(flow_col))
+                else:
+                    net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
+                # 历史接口没有 5日/10日 列，用主力净流入-净额的近 5/10 日累计代替
+                inflow_5d = inflow_10d = None
+                if flow_col is not None:
+                    series = pd.to_numeric(stock_df[flow_col], errors="coerce").dropna()
+                    if len(series):
+                        inflow_5d = float(series.tail(5).sum())
+                        inflow_10d = float(series.tail(10).sum())
                 result["stock_flow"] = {
                     "main_net_inflow": net_inflow,
                     "inflow_5d": inflow_5d,
