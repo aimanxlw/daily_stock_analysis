@@ -1254,8 +1254,13 @@ def run_full_analysis(
                 ):
                     logger.info("已推送飞书云文档链接（长文本已跳过）")
                 else:
-                    logger.warning("飞书云文档链接推送失败")
-            elif merge_notification and (results or market_report):
+                    # 链接发不出去就必须回退长文本：否则文档已建好、长文本被跳过，
+                    # 群里一条消息都没有，而进程仍以成功退出。
+                    # 与 market-only 路径的 _deliver_market_review_report 保持一致。
+                    logger.warning("飞书云文档链接推送失败，回退为合并长文本推送")
+                    feishu_doc_url = None
+
+            if not feishu_doc_url and merge_notification and (results or market_report):
                 parts = []
                 if market_report:
                     parts.append(f"# 📈 大盘复盘\n\n{market_report}")
@@ -1860,11 +1865,18 @@ def main() -> int:
             _review_report_text = getattr(market_review_result, "report", "") or ""
 
             if _feishu_doc_ready:
-                _deliver_market_review_report(
+                _delivered = _deliver_market_review_report(
                     notifier=notifier,
                     report_text=_review_report_text,
                     no_notify=bool(args.no_notify),
                 )
+                # 投递失败意味着文档链接和长文本都没送到群里。此处必须让进程失败退出，
+                # 否则 Actions 会显示成功，而群里什么都没有。
+                if not _delivered and not args.no_notify:
+                    logger.error(
+                        "大盘复盘已生成，但飞书投递失败（文档链接与长文本均未送达）"
+                    )
+                    return 1
 
             return 0 if _review_report_text.strip() else 1
 

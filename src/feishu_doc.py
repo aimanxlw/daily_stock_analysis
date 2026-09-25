@@ -71,6 +71,13 @@ class FeishuDocManager:
             batch_size = 50
             doc_block_id = doc_id  # 文档本身也是一个 block
 
+            if not blocks:
+                # 内容为空时文档已建好但没有正文。若仍返回链接，上游会判定投递成功
+                # 并静默长文本推送，最终群里只收到一个空白文档。此处返回 None，
+                # 让上游回退为长文本推送。
+                logger.error("待写入的文档内容为空，放弃该文档并回退长文本推送")
+                return None
+
             for i in range(0, len(blocks), batch_size):
                 batch_blocks = blocks[i:i + batch_size]
 
@@ -87,7 +94,13 @@ class FeishuDocManager:
                 write_resp = self.client.docx.v1.document_block_children.create(batch_add_request)
 
                 if not write_resp.success():
-                    logger.error(f"写入文档内容失败(批次{i}): {write_resp.code} - {write_resp.msg}")
+                    # 写入失败必须让调用方感知：继续返回 doc_url 会导致推送一个空白文档，
+                    # 而运行日志看起来是成功的。
+                    logger.error(
+                        f"写入文档内容失败(批次{i}): {write_resp.code} - {write_resp.msg}，"
+                        "放弃该文档并回退长文本推送"
+                    )
+                    return None
 
             logger.info(f"文档内容写入完成")
             return doc_url

@@ -2730,6 +2730,44 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(deliver.call_args.kwargs["report_text"], "# 大盘复盘\n\n正文内容")
         self.assertFalse(deliver.call_args.kwargs["no_notify"])
 
+    def test_market_review_mode_returns_nonzero_when_doc_delivery_fails(self) -> None:
+        """云文档模式下投递失败（链接与长文本都没送到）必须以非零退出码暴露。
+
+        回归点：修复前 _deliver_market_review_report 的返回值被丢弃，
+        大盘复盘生成成功而群里没收到任何消息，进程仍返回 0，
+        Actions 会显示「运行成功」。
+        """
+        args = self._make_args(market_review=True)
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_region="cn",
+            market_review_enabled=False,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret_test",
+            feishu_folder_token="fld_test",
+        )
+        run_result = SimpleNamespace(report="# 大盘复盘\n\n正文内容")
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch(
+                 "main._run_market_review_with_shared_lock",
+                 return_value=run_result,
+             ), \
+             patch(
+                 "src.core.market_review_runtime.build_market_review_runtime",
+                 return_value=(MagicMock(), MagicMock(), MagicMock()),
+             ), \
+             patch("src.core.market_review.run_market_review"), \
+             patch("main._deliver_market_review_report", return_value=False), \
+             patch("src.core.trading_calendar.get_open_markets_today", return_value={"cn"}), \
+             patch("src.core.trading_calendar.compute_effective_region", return_value="cn"):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 1)
+
     def test_market_review_mode_does_not_deliver_when_doc_not_configured(self) -> None:
         """无云文档凭据时保持原行为：不静默，也不走文档投递。"""
         args = self._make_args(market_review=True)

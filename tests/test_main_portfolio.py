@@ -463,6 +463,68 @@ class MainPortfolioTest(unittest.TestCase):
         self.assertIn("https://feishu.example/doc", sent)
         self.assertNotIn("# 🚀 个股决策仪表盘", sent)
 
+    def test_doc_link_send_failure_falls_back_to_merged_long_text(self):
+        """云文档链接推送失败时必须回退长文本，否则群里一条消息都收不到。
+
+        回归点：修复前链接发送失败只打一条 warning，长文本分支被跳过，
+        文档已建好而群里没有任何消息，进程仍以成功退出。
+        """
+        args = SimpleNamespace(
+            portfolio=None,
+            single_notify=False,
+            no_context_snapshot=True,
+            no_market_review=False,
+            workers=1,
+            dry_run=False,
+            no_notify=False,
+            schedule=False,
+        )
+        config = self._build_doc_mode_config()
+        results = [
+            SimpleNamespace(
+                code="600519",
+                success=True,
+                sentiment_score=90,
+                name="贵州茅台",
+                operation_advice="持有",
+                trend_prediction="震荡上行",
+                get_emoji=MagicMock(return_value="📈"),
+            )
+        ]
+        pipeline = self._build_doc_mode_pipeline(results)
+        # 第一次发送（文档链接）失败，第二次（回退的长文本）成功
+        pipeline.notifier.send = MagicMock(side_effect=[False, True])
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), patch.object(
+            main,
+            "_compute_trading_day_filter",
+            return_value=(["600519"], "cn", False),
+        ), patch(
+            "src.core.pipeline.StockAnalysisPipeline",
+            return_value=pipeline,
+        ), patch.object(
+            main,
+            "_run_market_review_with_shared_lock",
+            return_value=SimpleNamespace(report="market review"),
+        ), patch(
+            "src.feishu_doc.FeishuDocManager",
+        ) as feishu_manager, patch.object(
+            main,
+            "_run_auto_backtest",
+        ):
+            feishu_instance = feishu_manager.return_value
+            feishu_instance.is_configured.return_value = True
+            feishu_instance.create_daily_doc.return_value = "https://feishu.example/doc"
+            main.run_full_analysis(config, args, ["600519"])
+
+        self.assertEqual(pipeline.notifier.send.call_count, 2)
+        first_sent = pipeline.notifier.send.call_args_list[0].args[0]
+        second_sent = pipeline.notifier.send.call_args_list[1].args[0]
+        self.assertIn("https://feishu.example/doc", first_sent)
+        # 回退的第二条必须是完整长文本，而不是再发一次链接
+        self.assertIn("# 🚀 个股决策仪表盘", second_sent)
+        self.assertNotIn("https://feishu.example/doc", second_sent)
+
     def _build_doc_mode_config(self, **overrides):
         """构造「云文档凭据齐全」的 config，供下方三种模式测试复用。"""
         base = dict(
