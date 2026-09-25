@@ -148,31 +148,110 @@ def get_market_for_stock(code: str) -> Optional[str]:
     return None
 
 
+# 日历降级告警去重键：(market, year)。避免每天每个股票都刷同一条告警。
+_DEGRADED_CALENDAR_WARNED: Set[Tuple[str, int]] = set()
+
+
+def _weekday_only_trading_day(check_date: date) -> bool:
+    """日历不可用或未覆盖该日期时的兜底：只按「周一至周五」判断可能交易日。
+
+    之所以不能更精确：中国等市场的法定节假日与调休安排由主管机构逐年公布
+    （国务院通常在头一年 11 月发布次年安排），任何日历库都无法预知多年之后的
+    安排。因此这里只能排除周末 —— 工作日的法定节假日仍可能被误判为交易日，
+    需要靠日历数据更新来恢复精确判断。
+    """
+    return check_date.weekday() < 5
+
+
+def _warn_degraded_calendar(
+    market: str,
+    check_date: date,
+    *,
+    coverage_end: Optional[date] = None,
+    reason: str = "",
+) -> None:
+    """在日历降级时输出一次告警（按 market+year 去重）。"""
+    key = (market, check_date.year)
+    if key in _DEGRADED_CALENDAR_WARNED:
+        return
+    _DEGRADED_CALENDAR_WARNED.add(key)
+
+    if coverage_end is not None:
+        logger.warning(
+            "交易日历[%s]数据未覆盖 %s（仅到 %s），已降级为「仅排除周末」判断："
+            "该市场的法定节假日可能被误判为交易日并触发推送。"
+            "升级 exchange-calendars 可恢复精确判断。",
+            market,
+            check_date.isoformat(),
+            coverage_end.isoformat(),
+        )
+    else:
+        logger.warning(
+            "交易日历[%s]不可用（%s），已降级为「仅排除周末」判断："
+            "法定节假日可能被误判为交易日并触发推送。",
+            market,
+            reason or "原因未知",
+        )
+
+
 def is_market_open(market: str, check_date: date) -> bool:
     """
     Check if the given market is open on the given date.
 
-    Fail-open: returns True if exchange-calendars unavailable or date out of range.
+    降级策略（按优先级）：
+      1. 日历可用且覆盖该日期 -> 精确判断（含法定节假日与调休）
+      2. 日期超出日历覆盖范围 -> 仅排除周末，并输出一次告警
+      3. 日历不可用/异常      -> 仅排除周末，并输出一次告警
+
+    注意 2/3 属于降级：会排除周末，但工作日的法定节假日可能被误判为交易日。
+    之所以不直接返回 False，是因为在数据缺失时全年不推送的代价高于偶发多推一次。
 
     Args:
-        market: 'cn' | 'hk' | 'us'
+        market: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw'
         check_date: Date to check
 
     Returns:
-        True if trading day (or fail-open), False otherwise
+        True if trading day (degraded: weekday-based), False otherwise
     """
     if not _XCALS_AVAILABLE:
-        return True
+        _warn_degraded_calendar(market, check_date, reason="exchange-calendars 未安装")
+        return _weekday_only_trading_day(check_date)
     ex = MARKET_EXCHANGE.get(market)
     if not ex:
+        # 未知市场保持 fail-open：没有可依据的日历，不能擅自判定为休市。
         return True
     try:
         cal = xcals.get_calendar(ex)
+        if check_date < cal.first_session.date() or check_date > cal.last_session.date():
+            _warn_degraded_calendar(
+                market, check_date, coverage_end=cal.last_session.date()
+            )
+            return _weekday_only_trading_day(check_date)
         session = datetime(check_date.year, check_date.month, check_date.day)
         return cal.is_session(session)
     except Exception as e:
-        logger.warning("trading_calendar.is_market_open fail-open: %s", e)
-        return True
+        _warn_degraded_calendar(market, check_date, reason=f"日历查询异常: {e}")
+        return _weekday_only_trading_day(check_date)
+
+
+def get_calendar_coverage() -> Dict[str, Tuple[date, date]]:
+    """Return each market's calendar coverage window, for diagnostics.
+
+    Returns:
+        {market: (first_session_date, last_session_date)}，不可用的市场被跳过。
+        用于提前发现「日历数据即将到期」——超出覆盖范围后交易日判断会降级为
+        仅排除周末，法定节假日将被误判为交易日。
+    """
+    coverage: Dict[str, Tuple[date, date]] = {}
+    if not _XCALS_AVAILABLE:
+        return coverage
+    for market, exchange in MARKET_EXCHANGE.items():
+        try:
+            cal = xcals.get_calendar(exchange)
+            coverage[market] = (cal.first_session.date(), cal.last_session.date())
+        except Exception as e:  # pragma: no cover - 依赖库异常时跳过
+            logger.warning("获取 %s(%s) 日历覆盖范围失败: %s", market, exchange, e)
+    return coverage
 
 
 def get_market_now(
